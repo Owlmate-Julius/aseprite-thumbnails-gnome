@@ -1,0 +1,702 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: MIT
+"""Thumbnailer for Aseprite files (.aseprite / .ase).
+
+Reads the file format directly using only the Python standard library.
+It needs neither Aseprite nor network access, so it works inside GNOME's
+bubblewrap thumbnailer sandbox. The first frame is rendered the way
+Aseprite renders it (visible layers, opacity, blend modes, groups,
+indexed/grayscale color, tilemaps).
+
+File format: https://github.com/aseprite/aseprite/blob/main/docs/ase-file-specs.md
+
+Usage: ase-thumbnailer -i INPUT -o OUTPUT.png [-s SIZE]
+Without -s the image is written at its original size.
+"""
+
+import argparse
+import struct
+import sys
+import zlib
+
+VERSION = "1.0.0"
+
+# Limits against broken or malicious files.
+MAX_FRAME_BYTES = 256 * 1024 * 1024
+MAX_IMAGE_PIXELS = 8192 * 8192
+MAX_DECODED_BYTES = 256 * 1024 * 1024
+MAX_PALETTE_SIZE = 65536
+
+HEADER_SIZE = 128
+FRAME_HEADER_SIZE = 16
+HEADER_MAGIC = 0xA5E0
+FRAME_MAGIC = 0xF1FA
+
+HEADER_LAYER_OPACITY_VALID = 1
+
+CHUNK_OLD_PALETTE_256 = 0x0004
+CHUNK_OLD_PALETTE_64 = 0x0011
+CHUNK_LAYER = 0x2004
+CHUNK_CEL = 0x2005
+CHUNK_PALETTE = 0x2019
+CHUNK_TILESET = 0x2023
+
+LAYER_VISIBLE = 1
+LAYER_BACKGROUND = 8
+LAYER_REFERENCE = 64
+
+LAYER_GROUP = 1
+LAYER_TILEMAP = 2
+
+CEL_RAW = 0
+CEL_COMPRESSED = 2
+CEL_TILEMAP = 3
+
+TILESET_EXTERNAL = 1
+TILESET_EMBEDDED = 2
+
+BLEND_NORMAL = 0
+
+TRANSPARENT = (0, 0, 0, 0)
+
+
+class AseError(Exception):
+    pass
+
+
+# --- Reading -----------------------------------------------------------------
+
+class Reader:
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+
+    def unpack(self, fmt):
+        size = struct.calcsize(fmt)
+        if self.pos + size > len(self.data):
+            raise AseError("unexpected end of chunk")
+        values = struct.unpack_from(fmt, self.data, self.pos)
+        self.pos += size
+        return values
+
+    def read(self, n):
+        if self.pos + n > len(self.data):
+            raise AseError("unexpected end of chunk")
+        data = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return data
+
+    def skip(self, n):
+        self.read(n)
+
+    def string(self):
+        (length,) = self.unpack("<H")
+        return bytes(self.read(length)).decode("utf-8", "replace")
+
+    def rest(self):
+        return self.data[self.pos:]
+
+
+class Budget:
+    """Caps the total amount of decompressed data."""
+
+    def __init__(self):
+        self.remaining = MAX_DECODED_BYTES
+
+    def take(self, n):
+        if n > self.remaining:
+            raise AseError("image data too large")
+        self.remaining -= n
+
+
+def check_image_size(width, height, count=1):
+    if width * height * count > MAX_IMAGE_PIXELS:
+        raise AseError("image too large")
+
+
+def inflate(data, size, budget):
+    budget.take(size)
+    try:
+        out = zlib.decompressobj().decompress(data, size)
+    except zlib.error as e:
+        raise AseError(f"corrupt image data: {e}") from None
+    if len(out) < size:
+        raise AseError("truncated image data")
+    return out
+
+
+class Layer:
+    def __init__(self, index, flags, kind, level, blend, opacity, tileset):
+        self.index = index
+        self.flags = flags
+        self.kind = kind
+        self.level = level
+        self.blend = blend
+        self.opacity = opacity
+        self.tileset = tileset
+        self.children = []
+
+
+class Cel:
+    def __init__(self, x, y, width, height, opacity, z, fetch):
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.opacity = opacity
+        self.z = z
+        # fetch(cx, cy) returns the RGBA tuple at cel-local coordinates.
+        self.fetch = fetch
+
+
+class Tileset:
+    def __init__(self, tile_width, tile_height, count, pixels):
+        self.tile_width = tile_width
+        self.tile_height = tile_height
+        self.count = count
+        self.pixels = pixels
+
+
+class Sprite:
+    def __init__(self, width, height, depth, flags, transparent_index):
+        self.width = width
+        self.height = height
+        self.depth = depth
+        self.flags = flags
+        self.transparent_index = transparent_index
+        self.layers = []
+        self.root = Layer(-1, LAYER_VISIBLE, LAYER_GROUP, -1, BLEND_NORMAL, 255, None)
+        self.cels = {}
+        self.palette = [(0, 0, 0, 255)] * 256
+        self.tilesets = {}
+
+
+def read_sprite(path):
+    with open(path, "rb") as f:
+        header = f.read(HEADER_SIZE)
+        if len(header) < HEADER_SIZE:
+            raise AseError("file too small")
+        _, magic, frames, width, height, depth, flags = struct.unpack_from("<IHHHHHI", header, 0)
+        if magic != HEADER_MAGIC:
+            raise AseError("not an Aseprite file")
+        if frames < 1 or width < 1 or height < 1:
+            raise AseError("empty sprite")
+        if depth not in (8, 16, 32):
+            raise AseError(f"unsupported color depth {depth}")
+
+        frame_header = f.read(FRAME_HEADER_SIZE)
+        if len(frame_header) < FRAME_HEADER_SIZE:
+            raise AseError("missing first frame")
+        frame_size, frame_magic, old_chunks, _ = struct.unpack_from("<IHHH", frame_header, 0)
+        (new_chunks,) = struct.unpack_from("<I", frame_header, 12)
+        if frame_magic != FRAME_MAGIC:
+            raise AseError("corrupt frame header")
+        if not FRAME_HEADER_SIZE <= frame_size <= MAX_FRAME_BYTES:
+            raise AseError("invalid frame size")
+        body = f.read(frame_size - FRAME_HEADER_SIZE)
+        if len(body) < frame_size - FRAME_HEADER_SIZE:
+            raise AseError("truncated first frame")
+
+    chunks = []
+    pos = 0
+    for _ in range(new_chunks or old_chunks):
+        if pos + 6 > len(body):
+            raise AseError("truncated chunk header")
+        size, kind = struct.unpack_from("<IH", body, pos)
+        if size < 6 or pos + size > len(body):
+            raise AseError("invalid chunk size")
+        chunks.append((kind, memoryview(body)[pos + 6:pos + size]))
+        pos += size
+
+    sprite = Sprite(width, height, depth, flags, header[28])
+    budget = Budget()
+    has_new_palette = any(kind == CHUNK_PALETTE for kind, _ in chunks)
+    cel_chunks = []
+    for kind, data in chunks:
+        if kind == CHUNK_LAYER:
+            read_layer(sprite, Reader(data))
+        elif kind == CHUNK_CEL:
+            cel_chunks.append(data)
+        elif kind == CHUNK_PALETTE:
+            read_palette(sprite, Reader(data))
+        elif kind in (CHUNK_OLD_PALETTE_256, CHUNK_OLD_PALETTE_64) and not has_new_palette:
+            read_old_palette(sprite, Reader(data), kind == CHUNK_OLD_PALETTE_64)
+        elif kind == CHUNK_TILESET:
+            read_tileset(sprite, Reader(data), budget)
+    # Cels last: they need the complete layer list, palette and tilesets.
+    for data in cel_chunks:
+        read_cel(sprite, Reader(data), budget)
+
+    build_layer_tree(sprite)
+    return sprite
+
+
+def read_layer(sprite, r):
+    flags, kind, level, _, _, blend, opacity = r.unpack("<HHHHHHB")
+    r.skip(3)
+    r.string()
+    tileset = None
+    if kind == LAYER_TILEMAP:
+        (tileset,) = r.unpack("<I")
+    if not sprite.flags & HEADER_LAYER_OPACITY_VALID:
+        opacity = 255
+    sprite.layers.append(Layer(len(sprite.layers), flags, kind, level, blend, opacity, tileset))
+
+
+def build_layer_tree(sprite):
+    # stack[level] is the group that receives layers of that child level.
+    stack = [sprite.root]
+    for layer in sprite.layers:
+        level = min(layer.level, len(stack) - 1)
+        del stack[level + 1:]
+        stack[level].children.append(layer)
+        if layer.kind == LAYER_GROUP:
+            stack.append(layer)
+
+
+def read_palette(sprite, r):
+    size, first, last = r.unpack("<III")
+    r.skip(8)
+    if size > MAX_PALETTE_SIZE or first > last or last >= MAX_PALETTE_SIZE:
+        raise AseError("invalid palette")
+    needed = max(size, last + 1)
+    if len(sprite.palette) < needed:
+        sprite.palette.extend([(0, 0, 0, 255)] * (needed - len(sprite.palette)))
+    for i in range(first, last + 1):
+        (entry_flags,) = r.unpack("<H")
+        sprite.palette[i] = r.unpack("<BBBB")
+        if entry_flags & 1:
+            r.string()
+
+
+def read_old_palette(sprite, r, six_bit):
+    (packets,) = r.unpack("<H")
+    index = 0
+    for _ in range(packets):
+        skip, count = r.unpack("<BB")
+        index += skip
+        for _ in range(count or 256):
+            red, green, blue = r.unpack("<BBB")
+            if six_bit:
+                red, green, blue = red * 255 // 63, green * 255 // 63, blue * 255 // 63
+            if index < len(sprite.palette):
+                sprite.palette[index] = (red, green, blue, 255)
+            index += 1
+
+
+def read_tileset(sprite, r, budget):
+    tileset_id, flags, count = r.unpack("<III")
+    tile_width, tile_height = r.unpack("<HH")
+    r.skip(2 + 14)
+    r.string()
+    if flags & TILESET_EXTERNAL:
+        r.skip(8)
+    if not flags & TILESET_EMBEDDED:
+        return
+    (length,) = r.unpack("<I")
+    check_image_size(tile_width, tile_height, count)
+    size = tile_width * tile_height * count * (sprite.depth // 8)
+    pixels = inflate(r.read(length), size, budget)
+    sprite.tilesets[tileset_id] = Tileset(tile_width, tile_height, count, pixels)
+
+
+def color_reader(sprite, pixels, background):
+    """Returns get(i) -> RGBA tuple for pixel index i of an image buffer."""
+    if sprite.depth == 32:
+        def get(i):
+            i *= 4
+            return (pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3])
+    elif sprite.depth == 16:
+        def get(i):
+            v = pixels[2 * i]
+            return (v, v, v, pixels[2 * i + 1])
+    else:
+        palette = sprite.palette
+        transparent = -1 if background else sprite.transparent_index
+
+        def get(i):
+            index = pixels[i]
+            if index == transparent or index >= len(palette):
+                return TRANSPARENT
+            return palette[index]
+    return get
+
+
+def read_cel(sprite, r, budget):
+    layer_index, x, y, opacity, kind, z = r.unpack("<HhhBHh")
+    r.skip(5)
+    if layer_index >= len(sprite.layers):
+        return
+    layer = sprite.layers[layer_index]
+    background = bool(layer.flags & LAYER_BACKGROUND)
+    bpp = sprite.depth // 8
+
+    if kind in (CEL_RAW, CEL_COMPRESSED):
+        width, height = r.unpack("<HH")
+        check_image_size(width, height)
+        size = width * height * bpp
+        if kind == CEL_RAW:
+            budget.take(size)
+            pixels = r.read(size)
+        else:
+            pixels = inflate(r.rest(), size, budget)
+        get = color_reader(sprite, pixels, background)
+
+        def fetch(cx, cy):
+            return get(cy * width + cx)
+
+        sprite.cels[layer_index] = Cel(x, y, width, height, opacity, z, fetch)
+
+    elif kind == CEL_TILEMAP:
+        columns, rows, bits = r.unpack("<HHH")
+        id_mask, xflip_mask, yflip_mask, dflip_mask = r.unpack("<IIII")
+        r.skip(10)
+        if bits not in (8, 16, 32):
+            raise AseError(f"unsupported tile size {bits}")
+        tileset = sprite.tilesets.get(layer.tileset)
+        if tileset is None or tileset.tile_width == 0 or tileset.tile_height == 0:
+            return
+        check_image_size(columns, rows)
+        raw = inflate(r.rest(), columns * rows * bits // 8, budget)
+        tiles = memoryview(raw).cast({8: "B", 16: "H", 32: "I"}[bits])
+        tw, th = tileset.tile_width, tileset.tile_height
+        get = color_reader(sprite, tileset.pixels, background)
+
+        def fetch(cx, cy):
+            tile = tiles[(cy // th) * columns + cx // tw]
+            tile_id = tile & id_mask
+            if tile_id == 0 or tile_id >= tileset.count:
+                return TRANSPARENT
+            u, v = cx % tw, cy % th
+            if tile & dflip_mask:
+                u, v = v, u
+            if tile & xflip_mask:
+                u = tw - 1 - u
+            if tile & yflip_mask:
+                v = th - 1 - v
+            if u >= tw or v >= th:
+                return TRANSPARENT
+            return get((tile_id * th + v) * tw + u)
+
+        sprite.cels[layer_index] = Cel(x, y, columns * tw, rows * th, opacity, z, fetch)
+
+    # Linked cels (kind 1) can only point to earlier frames, so they never
+    # occur in the first frame in a meaningful way. Unknown kinds are ignored.
+
+
+# --- Blending (integer math matches Aseprite's doc/blend_funcs.cpp) ----------
+
+def mul_un8(a, b):
+    t = a * b + 0x80
+    return ((t >> 8) + t) >> 8
+
+
+def div_un8(a, b):
+    return (a * 0xFF + b // 2) // b
+
+
+def c_div(a, b):
+    """Integer division truncating toward zero, like C."""
+    q = abs(a) // b
+    return q if a >= 0 else -q
+
+
+def blend_normal(b, s, opacity):
+    if b[3] == 0:
+        return (s[0], s[1], s[2], mul_un8(s[3], opacity))
+    if s[3] == 0:
+        return b
+    ba = b[3]
+    sa = mul_un8(s[3], opacity)
+    ra = sa + ba - mul_un8(ba, sa)
+    return (b[0] + c_div((s[0] - b[0]) * sa, ra),
+            b[1] + c_div((s[1] - b[1]) * sa, ra),
+            b[2] + c_div((s[2] - b[2]) * sa, ra),
+            ra)
+
+
+def blend_merge(b, s, opacity):
+    if b[3] == 0:
+        r, g, bl = s[0], s[1], s[2]
+    elif s[3] == 0:
+        r, g, bl = b[0], b[1], b[2]
+    else:
+        r = b[0] + mul_un8(s[0] - b[0], opacity)
+        g = b[1] + mul_un8(s[1] - b[1], opacity)
+        bl = b[2] + mul_un8(s[2] - b[2], opacity)
+    a = b[3] + mul_un8(s[3] - b[3], opacity)
+    if a == 0:
+        return TRANSPARENT
+    return (r, g, bl, a)
+
+
+def _multiply(b, s):
+    return mul_un8(b, s)
+
+
+def _screen(b, s):
+    return b + s - mul_un8(b, s)
+
+
+def _hard_light(b, s):
+    return _multiply(b, s << 1) if s < 128 else _screen(b, (s << 1) - 255)
+
+
+def _overlay(b, s):
+    return _hard_light(s, b)
+
+
+def _color_dodge(b, s):
+    if b == 0:
+        return 0
+    s = 255 - s
+    return 255 if b >= s else div_un8(b, s)
+
+
+def _color_burn(b, s):
+    if b == 255:
+        return 255
+    b = 255 - b
+    return 0 if b >= s else 255 - div_un8(b, s)
+
+
+def _soft_light(b, s):
+    b /= 255.0
+    s /= 255.0
+    d = ((16 * b - 12) * b + 4) * b if b <= 0.25 else b ** 0.5
+    if s <= 0.5:
+        r = b - (1.0 - 2.0 * s) * b * (1.0 - b)
+    else:
+        r = b + (2.0 * s - 1.0) * (d - b)
+    return int(r * 255 + 0.5)
+
+
+def _exclusion(b, s):
+    return b + s - 2 * mul_un8(b, s)
+
+
+def _divide(b, s):
+    if b == 0:
+        return 0
+    return 255 if b >= s else div_un8(b, s)
+
+
+def _lum(r, g, b):
+    return 0.3 * r + 0.59 * g + 0.11 * b
+
+
+def _sat(r, g, b):
+    return max(r, g, b) - min(r, g, b)
+
+
+def _clip_color(c):
+    l = _lum(*c)
+    n = min(c)
+    x = max(c)
+    if n < 0:
+        c = [l + (v - l) * l / (l - n) for v in c]
+    if x > 1:
+        c = [l + (v - l) * (1 - l) / (x - l) for v in c]
+    return c
+
+
+def _set_lum(c, l):
+    d = l - _lum(*c)
+    return _clip_color([v + d for v in c])
+
+
+def _set_sat(c, s):
+    c = list(c)
+    lo, mid, hi = sorted(range(3), key=lambda i: c[i])
+    if c[hi] > c[lo]:
+        c[mid] = (c[mid] - c[lo]) * s / (c[hi] - c[lo])
+        c[hi] = s
+    else:
+        c[mid] = c[hi] = 0.0
+    c[lo] = 0.0
+    return c
+
+
+def _hsl(b, s, mode):
+    bc = [v / 255.0 for v in b[:3]]
+    sc = [v / 255.0 for v in s[:3]]
+    if mode == 12:    # hue
+        c = _set_lum(_set_sat(sc, _sat(*bc)), _lum(*bc))
+    elif mode == 13:  # saturation
+        c = _set_lum(_set_sat(bc, _sat(*sc)), _lum(*bc))
+    elif mode == 14:  # color
+        c = _set_lum(sc, _lum(*bc))
+    else:             # luminosity
+        c = _set_lum(bc, _lum(*sc))
+    return (int(255.0 * c[0]), int(255.0 * c[1]), int(255.0 * c[2]), s[3])
+
+
+SEPARABLE = {
+    1: _multiply,
+    2: _screen,
+    3: _overlay,
+    4: min,
+    5: max,
+    6: _color_dodge,
+    7: _color_burn,
+    8: _hard_light,
+    9: _soft_light,
+    10: lambda b, s: abs(b - s),
+    11: _exclusion,
+    16: lambda b, s: min(b + s, 255),
+    17: lambda b, s: max(b - s, 0),
+    18: _divide,
+}
+
+
+def make_blender(mode):
+    if mode in SEPARABLE:
+        fn = SEPARABLE[mode]
+
+        def colorize(b, s):
+            return (fn(b[0], s[0]), fn(b[1], s[1]), fn(b[2], s[2]), s[3])
+    elif 12 <= mode <= 15:
+        def colorize(b, s):
+            return _hsl(b, s, mode)
+    else:
+        return blend_normal
+
+    # A blend mode only applies where the backdrop is opaque; over
+    # transparent areas it fades into normal blending.
+    def blend(b, s, opacity):
+        if b[3] == 0:
+            return blend_normal(b, s, opacity)
+        normal = blend_normal(b, s, opacity)
+        blended = blend_normal(b, colorize(b, s), opacity)
+        merged = blend_merge(normal, blended, b[3])
+        return blend_merge(merged, blended, mul_un8(b[3], mul_un8(s[3], opacity)))
+    return blend
+
+
+# --- Rendering ---------------------------------------------------------------
+
+def sample_positions(width, height, size):
+    """Source pixel coordinates for every output column and row.
+
+    Pixel art is scaled with nearest neighbour: shrunk to fit into
+    size x size, or enlarged by a whole-number factor so it stays sharp.
+    """
+    if size is None:
+        return list(range(width)), list(range(height))
+    longest = max(width, height)
+    if longest > size:
+        out_w = max(1, width * size // longest)
+        out_h = max(1, height * size // longest)
+    else:
+        factor = size // longest
+        out_w, out_h = width * factor, height * factor
+    xs = [(2 * o + 1) * width // (2 * out_w) for o in range(out_w)]
+    ys = [(2 * o + 1) * height // (2 * out_h) for o in range(out_h)]
+    return xs, ys
+
+
+def is_visible(layer):
+    return layer.flags & LAYER_VISIBLE and not layer.flags & LAYER_REFERENCE
+
+
+def collect(sprite, group, items):
+    """Adds the cels of all visible layers below a group.
+
+    Aseprite (as of 1.3.18) ignores group opacity and blend mode when
+    rendering, so groups only matter for visibility.
+    """
+    for layer in group.children:
+        if not is_visible(layer):
+            continue
+        if layer.kind == LAYER_GROUP:
+            collect(sprite, layer, items)
+        elif layer.index in sprite.cels:
+            cel = sprite.cels[layer.index]
+            items.append(((layer.index + cel.z, cel.z), layer, cel))
+
+
+def draw_layers(sprite, canvas, xs, ys):
+    items = []
+    collect(sprite, sprite.root, items)
+    items.sort(key=lambda item: item[0])
+    for _, layer, cel in items:
+        draw_cel(cel, mul_un8(cel.opacity, layer.opacity), layer.blend, canvas, xs, ys)
+
+
+def draw_cel(cel, opacity, mode, canvas, xs, ys):
+    if opacity == 0:
+        return
+    blend = make_blender(mode)
+    fast = mode == BLEND_NORMAL and opacity == 255
+    columns = [(ox, sx - cel.x) for ox, sx in enumerate(xs) if 0 <= sx - cel.x < cel.width]
+    fetch = cel.fetch
+    width = len(xs)
+    for oy, sy in enumerate(ys):
+        cy = sy - cel.y
+        if not 0 <= cy < cel.height:
+            continue
+        row = oy * width
+        for ox, cx in columns:
+            s = fetch(cx, cy)
+            if s[3] == 0:
+                continue
+            i = row + ox
+            if fast and s[3] == 255:
+                canvas[i] = s
+            else:
+                canvas[i] = blend(canvas[i], s, opacity)
+
+
+def render(sprite, size):
+    xs, ys = sample_positions(sprite.width, sprite.height, size)
+    canvas = [TRANSPARENT] * (len(xs) * len(ys))
+    draw_layers(sprite, canvas, xs, ys)
+    return len(xs), len(ys), canvas
+
+
+# --- Output ------------------------------------------------------------------
+
+def write_png(path, width, height, canvas):
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)
+        for r, g, b, a in canvas[y * width:(y + 1) * width]:
+            raw += bytes((r, g, b, a)) if a else b"\0\0\0\0"
+
+    def chunk(kind, data):
+        crc = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(chunk(b"IHDR", ihdr))
+        f.write(chunk(b"IDAT", zlib.compress(bytes(raw), 6)))
+        f.write(chunk(b"IEND", b""))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="ase-thumbnailer",
+        description="Creates PNG thumbnails of Aseprite files (first frame).")
+    parser.add_argument("-i", dest="input", required=True, help="input .aseprite/.ase file")
+    parser.add_argument("-o", dest="output", required=True, help="output PNG file")
+    parser.add_argument("-s", dest="size", type=int,
+                        help="maximum width and height (default: original size)")
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}")
+    args = parser.parse_args(argv)
+    if args.size is not None and args.size < 1:
+        parser.error("-s must be greater than 0")
+
+    try:
+        sprite = read_sprite(args.input)
+        width, height, canvas = render(sprite, args.size)
+        write_png(args.output, width, height, canvas)
+    except (AseError, OSError, MemoryError) as e:
+        print(f"ase-thumbnailer: {args.input}: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
